@@ -136,7 +136,7 @@ jobs:
         run: ls -la "$GITHUB_WORKSPACE/out" || true
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           # artifact name includes lts info when present
           name: ${{ format('{0}-{1}{2}', matrix.target.name, matrix.target.arch, matrix.target.lts_major != null && format('-lts{0}', matrix.target.lts_major) || '') }}
@@ -151,7 +151,7 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
 

@@ -12,6 +12,13 @@ want to help contribute the latest versions of **onyxblds**? here's all you need
 **v.txt commits:**
 - in order:
 - glibc version in .github/workflows/release.yml
-- box64 version in .github/workflows/release.yml
+- box64 latest version from [ptitSeb/box64](https://github.com/ptitSeb/box64)
 - LTS UML kernel version in .github/workflows/release.yml
 - LTS UML kernel (backward-compat) version in .github/workflows/release.yml
+
+**update versioning:**
+- **example: 26w08a**
+- 26 -> year (2026)
+- w (week)
+- 08 -> week (week 8 of 52)
+- a -> snapshot (snapshot 1 or a of week 8)

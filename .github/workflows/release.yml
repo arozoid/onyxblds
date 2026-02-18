@@ -3,15 +3,16 @@ name: build weekly snapshot
 on:
   push:
     tags:
-      - '*'  # still run on manual snapshot tags
+      - '*'               # still run on manual snapshot tags
   schedule:
-    - cron: '0 4 * * 1'  # every Monday at 04:00 UTC
+    - cron: '0 04 * * 1'  # weekly: every Monday at 04:00 UTC
 
 permissions:
-  contents: write
+  contents: write        # needed to create tags/releases
 
 jobs:
   build:
+    name: build (matrix)
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -37,98 +38,217 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v3
 
-      - name: Set up QEMU
+      - name: Set up QEMU (for cross-compilation)
         uses: docker/setup-qemu-action@v3
         with:
           platforms: linux/arm64,linux/amd64
 
-      - name: Install dependencies
+      - name: Install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential wget curl git bc bison flex libssl-dev libncurses5-dev cmake xz-utils
-
-      - name: Determine snapshot tag
-        id: snapshot
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            # manual tag push
-            echo "SNAPSHOT_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-          else
-            # generate YYwWW for weekly snapshot
-            YEAR=$(date +%y)
-            WEEK=$(date +%V)
-            SNAPSHOT_TAG="${YEAR}w${WEEK}"
-            echo "SNAPSHOT_TAG=$SNAPSHOT_TAG" >> $GITHUB_ENV
-          fi
-          echo "Using snapshot tag: $SNAPSHOT_TAG"
 
       - name: Build artifact
         env:
           MATRIX_TARGET_NAME: ${{ matrix.target.name }}
           MATRIX_TARGET_ARCH: ${{ matrix.target.arch }}
           MATRIX_TARGET_LTS: ${{ matrix.target.lts_major }}
+          WORKDIR: ${{ github.workspace }}
         run: |
-          mkdir -p out
+          set -euo pipefail
+          mkdir -p "$WORKDIR/out"
 
-          # --------- glibc ----------
           if [ "$MATRIX_TARGET_NAME" = "glibc" ]; then
+            # find latest glibc tarball from GNU
             GLIBC_FULL=$(curl -s http://ftp.gnu.org/gnu/libc/ | grep -oP 'glibc-\d+\.\d+(\.\d+)?\.tar\.gz' | sort -V | tail -n1)
+            if [ -z "$GLIBC_FULL" ]; then
+              echo "Failed to detect latest glibc"
+              exit 1
+            fi
             GLIBC_VERSION=${GLIBC_FULL%.tar.gz}
-            echo $GLIBC_VERSION > out/v_glibc.txt
-            wget http://ftp.gnu.org/gnu/libc/$GLIBC_FULL
-            tar xf $GLIBC_FULL
-            mkdir glibc-build && cd glibc-build
-            ../$GLIBC_VERSION/configure --prefix=/usr --host=${MATRIX_TARGET_ARCH}-linux-gnu
-            make -j$(nproc)
-            make DESTDIR=$PWD/out install
+            echo "Detected GLIBC: $GLIBC_VERSION"
+            echo "$GLIBC_VERSION" > "$WORKDIR/out/v_glibc.txt"
 
-          # --------- box64 ----------
+            wget -q "http://ftp.gnu.org/gnu/libc/$GLIBC_FULL"
+            tar xf "$GLIBC_FULL"
+            mkdir -p glibc-build && cd glibc-build
+            "../$GLIBC_VERSION/configure" --prefix=/usr --host="${MATRIX_TARGET_ARCH}-linux-gnu"
+            make -j"$(nproc)"
+            make DESTDIR="$PWD/out" install
+
           elif [ "$MATRIX_TARGET_NAME" = "box64" ]; then
+            # shallow clone latest
             git clone --depth 1 https://github.com/ptitSeb/box64.git
-            cd box64
-            BOX64_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.4.0")
-            echo $BOX64_VERSION > ../out/v_box64.txt
-            mkdir build && cd build
-            cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=${MATRIX_TARGET_ARCH}
-            make -j$(nproc)
-            cp box64 ../../out/
+            cd box64 || exit 1
 
-          # --------- UML kernels ----------
+            # attempt to get a tag; fallback to commit hash if none
+            BOX64_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || git rev-parse --short HEAD || echo "unknown")
+            echo "Detected BOX64: $BOX64_VERSION"
+            echo "$BOX64_VERSION" > "$WORKDIR/out/v_box64.txt"
+
+            mkdir -p build && cd build
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR="${MATRIX_TARGET_ARCH}"
+            make -j"$(nproc)"
+            # copy binary to out
+            cp box64 "$WORKDIR/out/" || true
+
           elif [ "$MATRIX_TARGET_NAME" = "uml" ]; then
+            if [ -z "${MATRIX_TARGET_LTS:-}" ]; then
+              echo "No LTS specified for uml target"
+              exit 1
+            fi
+
             LTS=${MATRIX_TARGET_LTS}
-            KERNEL_LIST=$(curl -s https://cdn.kernel.org/pub/linux/kernel/v${LTS}.x/ | grep -oP "linux-${LTS}\.\d+\.\d+\.tar\.xz" | sort -V)
-            KERNEL_FULL=$(echo "$KERNEL_LIST" | tail -n1)
+            # find latest patch in the LTS series (e.g., 6.x or 5.x)
+            KLIST=$(curl -s "https://cdn.kernel.org/pub/linux/kernel/v${LTS}.x/" | grep -oP "linux-${LTS}\.\d+\.\d+\.tar\.xz" | sort -V || true)
+            KERNEL_FULL=$(echo "$KLIST" | tail -n1)
+            if [ -z "$KERNEL_FULL" ]; then
+              echo "Failed to detect kernel for LTS $LTS"
+              exit 1
+            fi
             KERNEL_VERSION=${KERNEL_FULL#linux-}
             KERNEL_VERSION=${KERNEL_VERSION%.tar.xz}
-            echo $KERNEL_VERSION > ../out/v_kernel_${LTS}.txt
+            echo "Detected kernel LTS $LTS: $KERNEL_VERSION"
+            echo "$KERNEL_VERSION" > "$WORKDIR/out/v_kernel_${LTS}.txt"
 
-            wget https://cdn.kernel.org/pub/linux/kernel/v${LTS}.x/$KERNEL_FULL
-            tar xf $KERNEL_FULL
-            cd linux-$KERNEL_VERSION
-            make ARCH=$MATRIX_TARGET_ARCH defconfig
+            wget -q "https://cdn.kernel.org/pub/linux/kernel/v${LTS}.x/$KERNEL_FULL"
+            tar xf "$KERNEL_FULL"
+            cd "linux-$KERNEL_VERSION" || exit 1
+
+            # config + build; use appropriate image target per arch
+            make ARCH="$MATRIX_TARGET_ARCH" defconfig
 
             if [ "$MATRIX_TARGET_ARCH" = "x86_64" ]; then
-              make ARCH=x86_64 bzImage -j$(nproc)
-              cp arch/x86_64/boot/bzImage ../../out/bzImage-x86_64-kernel$KERNEL_VERSION
+              make ARCH=x86_64 bzImage -j"$(nproc)"
+              cp arch/x86_64/boot/bzImage "$WORKDIR/out/bzImage-x86_64-kernel${KERNEL_VERSION}"
             else
-              make ARCH=$MATRIX_TARGET_ARCH Image -j$(nproc)
-              cp arch/$MATRIX_TARGET_ARCH/boot/Image ../../out/Image-${MATRIX_TARGET_ARCH}-kernel$KERNEL_VERSION
+              # arm64/aarch64 produce 'Image'
+              make ARCH="$MATRIX_TARGET_ARCH" Image -j"$(nproc)"
+              cp "arch/$MATRIX_TARGET_ARCH/boot/Image" "$WORKDIR/out/Image-${MATRIX_TARGET_ARCH}-kernel${KERNEL_VERSION}"
             fi
+
+          else
+            echo "Unknown matrix target: $MATRIX_TARGET_NAME"
+            exit 1
           fi
 
-      - name: Combine versions into v.txt
+      - name: List out/ for debug
+        run: ls -la "$GITHUB_WORKSPACE/out" || true
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          # artifact name includes lts info when present
+          name: ${{ format('{0}-{1}{2}', matrix.target.name, matrix.target.arch, matrix.target.lts_major != null && format('-lts{0}', matrix.target.lts_major) || '') }}
+          path: ${{ github.workspace }}/out
+
+  release:
+    name: assemble + release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout repo (for tagging)
+        uses: actions/checkout@v3
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+
+      - name: Determine snapshot tag (YYwWW) or use manual tag
+        id: snapshot
         run: |
-          cat out/v_glibc.txt > out/v.txt
-          cat out/v_box64.txt >> out/v.txt
-          cat out/v_kernel_6.txt >> out/v.txt || true
-          cat out/v_kernel_5.txt >> out/v.txt || true
+          set -euo pipefail
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            SNAPSHOT_TAG="${GITHUB_REF#refs/tags/}"
+            echo "Manual tag detected: $SNAPSHOT_TAG"
+          else
+            YEAR=$(date +%y)
+            WEEK=$(date +%V)
+            SNAPSHOT_TAG="${YEAR}w${WEEK}"
+            echo "Generated weekly snapshot tag: $SNAPSHOT_TAG"
+          fi
+          echo "SNAPSHOT_TAG=$SNAPSHOT_TAG" >> $GITHUB_ENV
+          echo "snapshot=$SNAPSHOT_TAG" > snapshot.txt
 
-      - name: Debug out folder
-        run: ls -la out/
+      - name: Ensure tag exists (create/push if this run wasn't a tag push)
+        if: ${{ startsWith(github.ref, 'refs/tags/') == false }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${SNAPSHOT_TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # use tokenized remote so push works
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          # create annotated tag if not exists or update it
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "refs/tags/${TAG}"; then
+            echo "Tag ${TAG} already exists on remote; skipping pushing"
+          else
+            git tag -a "${TAG}" -m "Snapshot ${TAG} (generated by workflow)"
+            git push origin "refs/tags/${TAG}"
+            echo "Pushed tag ${TAG}"
+          fi
 
-      - name: Upload assets to release
+      - name: Gather version files and build v.txt
+        run: |
+          set -euo pipefail
+          mkdir -p assembled
+          # find downloaded artifacts (download-artifact creates directories per artifact)
+          # look for version files produced by builds:
+          GLIBC=$(find artifacts -type f -name "v_glibc.txt" -print -quit || true)
+          BOX64=$(find artifacts -type f -name "v_box64.txt" -print -quit || true)
+          K6=$(find artifacts -type f -name "v_kernel_6.txt" -print -quit || true)
+          K5=$(find artifacts -type f -name "v_kernel_5.txt" -print -quit || true)
+
+          # create assembled/v.txt with exact order:
+          # glibc, box64, kernel 6.x, kernel 5.x
+          : > assembled/v.txt
+          if [ -n "$GLIBC" ]; then
+            cat "$GLIBC" >> assembled/v.txt
+          else
+            echo "unknown" >> assembled/v.txt
+          fi
+
+          if [ -n "$BOX64" ]; then
+            cat "$BOX64" >> assembled/v.txt
+          else
+            echo "unknown" >> assembled/v.txt
+          fi
+
+          if [ -n "$K6" ]; then
+            cat "$K6" >> assembled/v.txt
+          else
+            echo "unknown" >> assembled/v.txt
+          fi
+
+          if [ -n "$K5" ]; then
+            cat "$K5" >> assembled/v.txt
+          else
+            echo "unknown" >> assembled/v.txt
+          fi
+
+          # also include human-readable "actuals" file (optional)
+          cat > assembled/actuals.txt <<'EOF'
+          glibc
+          box64
+          LTS UML kernel (6.x)
+          LTS UML kernel (5.x)
+          EOF
+
+          # copy all built binaries/trees into assembled/ so release attaches everything
+          # artifacts/* contains subfolders named by artifact; copy them in
+          mkdir -p assembled/artifacts
+          cp -a artifacts/* assembled/artifacts/ || true
+
+          # list for debug
+          echo "---- assembled contents ----"
+          ls -la assembled || true
+
+      - name: Create GitHub release and upload assembled artifacts
         uses: softprops/action-gh-release@v1
         with:
-          files: out/*
           tag_name: ${{ env.SNAPSHOT_TAG }}
+          files: assembled/*
           generate_release_notes: true

@@ -1,0 +1,81 @@
+name: Build Release Artifacts
+
+on:
+  push:
+    tags:
+      - 'v*'   # trigger on version tags
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - name: glibc
+            arch: arm64
+          - name: box64
+            arch: arm64
+          - name: uml
+            arch: x86_64
+            kernel: 5.15.200
+          - name: uml
+            arch: x86_64
+            kernel: 6.12.73
+          - name: uml
+            arch: arm64
+            kernel: 5.15.200
+          - name: uml
+            arch: arm64
+            kernel: 6.12.73
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up QEMU (for cross-compilation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm64,linux/amd64
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget curl git bc bison flex libssl-dev libncurses5-dev
+
+      - name: Build artifact
+        run: |
+          if [ "${{ matrix.target.name }}" = "glibc" ]; then
+            mkdir -p out
+            wget http://ftp.gnu.org/gnu/libc/glibc-2.42.tar.gz
+            tar xf glibc-2.42.tar.gz
+            mkdir glibc-build && cd glibc-build
+            ../glibc-2.40/configure --prefix=/usr --host=${{ matrix.target.arch }}-linux-gnu
+            make -j$(nproc)
+            make DESTDIR=$PWD/out install
+          elif [ "${{ matrix.target.name }}" = "box64" ]; then
+            git clone https://github.com/ptitSeb/box64.git
+            cd box64
+            mkdir build && cd build
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.target.arch }}
+            make -j$(nproc)
+            mkdir -p out && cp box64 out/
+          elif [ "${{ matrix.target.name }}" = "uml" ]; then
+            mkdir -p out && cd out
+            KERNEL_FULL=${{ matrix.target.kernel }}
+            KERNEL_MAJOR=$(echo $KERNEL_FULL | cut -d. -f1)
+            URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/linux-${KERNEL_FULL}.tar.xz"
+            wget $URL
+            tar xf linux-${{ matrix.target.kernel }}.tar.xz
+            cd linux-${{ matrix.target.kernel }}
+            make ARCH=${{ matrix.target.arch }} defconfig
+            make -j$(nproc) ARCH=${{ matrix.target.arch }} bzImage
+            cp arch/${{ matrix.target.arch }}/boot/bzImage ../
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ format('{0}-{1}{2}', matrix.target.name, matrix.target.arch, matrix.target.kernel != null && format('-kernel{0}', matrix.target.kernel) || '') }}
+          path: |
+            out/

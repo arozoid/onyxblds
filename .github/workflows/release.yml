@@ -118,15 +118,16 @@ jobs:
             # config + build; use appropriate image target per arch
             make ARCH="$MATRIX_TARGET_ARCH" defconfig
 
-            if [ "$MATRIX_TARGET_ARCH" = "x86_64" ]; then
-              make ARCH=x86_64 bzImage -j"$(nproc)"
-              cp arch/x86_64/boot/bzImage "$WORKDIR/out/bzImage-x86_64-kernel${KERNEL_VERSION}"
+            if [ "$MATRIX_TARGET_ARCH" = "arm64" ]; then
+              sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+              make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+              make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image
+              cp arch/arm64/boot/Image "$WORKDIR/out/Image-arm64-kernel$KERNEL_VERSION"
             else
-              # arm64/aarch64 produce 'Image'
-              make ARCH="$MATRIX_TARGET_ARCH" Image -j"$(nproc)"
-              cp "arch/$MATRIX_TARGET_ARCH/boot/Image" "$WORKDIR/out/Image-${MATRIX_TARGET_ARCH}-kernel${KERNEL_VERSION}"
+              make ARCH=x86_64 bzImage -j$(nproc)
+              cp arch/x86_64/boot/bzImage "$WORKDIR/out/bzImage-x86_64-kernel$KERNEL_VERSION"
             fi
-
+            
           else
             echo "Unknown matrix target: $MATRIX_TARGET_NAME"
             exit 1

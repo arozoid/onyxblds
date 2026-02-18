@@ -46,7 +46,11 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential wget curl cmake git bc bison flex libssl-dev libncurses5-dev xz-utils libelf-dev
+          sudo apt-get install -y \
+            build-essential wget curl cmake git bc bison flex \
+            libssl-dev libncurses5-dev xz-utils libelf-dev \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
       - name: Build artifact
         env:
           MATRIX_TARGET_NAME: ${{ matrix.target.name }}
@@ -58,8 +62,8 @@ jobs:
           mkdir -p "$WORKDIR/out"
 
           if [ "$MATRIX_TARGET_NAME" = "glibc" ]; then
-            # find latest glibc tarball from GNU
-            GLIBC_FULL=$(curl -s http://ftp.gnu.org/gnu/libc/ | grep -oP 'glibc-\d+\.\d+(\.\d+)?\.tar\.gz' | sort -V | tail -n1)
+            # latest stable glibc (avoid mainline experimental)
+            GLIBC_FULL=$(curl -s http://ftp.gnu.org/gnu/libc/ | grep -oP 'glibc-2\.\d+\.\d+\.tar\.gz' | sort -V | tail -n1)
             if [ -z "$GLIBC_FULL" ]; then
               echo "Failed to detect latest glibc"
               exit 1
@@ -71,34 +75,23 @@ jobs:
             wget -q "http://ftp.gnu.org/gnu/libc/$GLIBC_FULL"
             tar xf "$GLIBC_FULL"
             mkdir -p glibc-build && cd glibc-build
-            "../$GLIBC_VERSION/configure" --prefix=/usr --host="${MATRIX_TARGET_ARCH}-linux-gnu"
+
+            export CC=aarch64-linux-gnu-gcc
+            export CXX=aarch64-linux-gnu-g++
+            export AR=aarch64-linux-gnu-ar
+            export AS=aarch64-linux-gnu-as
+            export LD=aarch64-linux-gnu-ld
+            export RANLIB=aarch64-linux-gnu-ranlib
+            export STRIP=aarch64-linux-gnu-strip
+            export CROSS_COMPILE=aarch64-linux-gnu-
+
+            "../$GLIBC_VERSION/configure" --prefix=/usr --host="${MATRIX_TARGET_ARCH}-linux-gnu" --disable-werror
             make -j"$(nproc)"
             make DESTDIR="$PWD/out" install
 
-          elif [ "$MATRIX_TARGET_NAME" = "box64" ]; then
-            # shallow clone latest
-            git clone --depth 1 https://github.com/ptitSeb/box64.git
-            cd box64 || exit 1
-
-            # attempt to get a tag; fallback to commit hash if none
-            BOX64_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || git rev-parse --short HEAD || echo "unknown")
-            echo "Detected BOX64: $BOX64_VERSION"
-            echo "$BOX64_VERSION" > "$WORKDIR/out/v_box64.txt"
-
-            mkdir -p build && cd build
-            cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR="${MATRIX_TARGET_ARCH}"
-            make -j"$(nproc)"
-            # copy binary to out
-            cp box64 "$WORKDIR/out/" || true
-
           elif [ "$MATRIX_TARGET_NAME" = "uml" ]; then
-            if [ -z "${MATRIX_TARGET_LTS:-}" ]; then
-              echo "No LTS specified for uml target"
-              exit 1
-            fi
-
-            LTS=${MATRIX_TARGET_LTS}
-            # find latest patch in the LTS series (e.g., 6.x or 5.x)
+            LTS=${MATRIX_TARGET_LTS:?No LTS specified}
+            # pick latest LTS patch release
             KLIST=$(curl -s "https://cdn.kernel.org/pub/linux/kernel/v${LTS}.x/" | grep -oP "linux-${LTS}\.\d+\.\d+\.tar\.xz" | sort -V || true)
             KERNEL_FULL=$(echo "$KLIST" | tail -n1)
             if [ -z "$KERNEL_FULL" ]; then
@@ -114,25 +107,17 @@ jobs:
             tar xf "$KERNEL_FULL"
             cd "linux-$KERNEL_VERSION" || exit 1
 
-            # config + build; use appropriate image target per arch
-            make ARCH="$MATRIX_TARGET_ARCH" defconfig
-
             export KCFLAGS="-Wno-error=array-bounds"
 
             if [ "$MATRIX_TARGET_ARCH" = "arm64" ]; then
-              sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
               make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
               make -j$(nproc) ARCH=arm64 KCFLAGS="$KCFLAGS" CROSS_COMPILE=aarch64-linux-gnu- Image
               cp arch/arm64/boot/Image "$WORKDIR/out/Image-arm64-kernel$KERNEL_VERSION"
             else
-              make ARCH=x86_64 KCFLAGS="$KCFLAGS" bzImage -j$(nproc)
+              make ARCH=x86_64 KCFLAGS="$KCFLAGS" defconfig
+              make -j$(nproc) ARCH=x86_64 KCFLAGS="$KCFLAGS" bzImage
               cp arch/x86_64/boot/bzImage "$WORKDIR/out/bzImage-x86_64-kernel$KERNEL_VERSION"
             fi
-            
-          else
-            echo "Unknown matrix target: $MATRIX_TARGET_NAME"
-            exit 1
-          fi
 
       - name: List out/ for debug
         run: ls -la "$GITHUB_WORKSPACE/out" || true

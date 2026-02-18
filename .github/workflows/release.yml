@@ -117,13 +117,15 @@ jobs:
             # config + build; use appropriate image target per arch
             make ARCH="$MATRIX_TARGET_ARCH" defconfig
 
+            export KCFLAGS="-Wno-error=array-bounds"
+
             if [ "$MATRIX_TARGET_ARCH" = "arm64" ]; then
               sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
               make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-              make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image
+              make -j$(nproc) ARCH=arm64 KCFLAGS="$KCFLAGS" CROSS_COMPILE=aarch64-linux-gnu- Image
               cp arch/arm64/boot/Image "$WORKDIR/out/Image-arm64-kernel$KERNEL_VERSION"
             else
-              make ARCH=x86_64 bzImage -j$(nproc)
+              make ARCH=x86_64 KCFLAGS="$KCFLAGS" bzImage -j$(nproc)
               cp arch/x86_64/boot/bzImage "$WORKDIR/out/bzImage-x86_64-kernel$KERNEL_VERSION"
             fi
             

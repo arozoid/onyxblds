@@ -49,7 +49,8 @@ jobs:
           sudo apt-get install -y \
             build-essential wget curl cmake git bc bison flex \
             libssl-dev libncurses5-dev xz-utils libelf-dev \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            pkg-config
 
       - name: Build artifact
         env:
@@ -61,8 +62,14 @@ jobs:
           set -euo pipefail
           mkdir -p "$WORKDIR/out"
 
+          # map arch to host triple when needed
+          HOST_TRIPLE=""
+          if [ "${MATRIX_TARGET_ARCH}" = "arm64" ]; then
+            HOST_TRIPLE="aarch64-linux-gnu"
+          fi
+
           if [ "$MATRIX_TARGET_NAME" = "glibc" ]; then
-            # latest stable glibc (avoid mainline experimental)
+            # latest stable glibc (pick 2.x stable releases)
             GLIBC_FULL=$(curl -s http://ftp.gnu.org/gnu/libc/ | grep -oP 'glibc-2\.\d+\.\d+\.tar\.gz' | sort -V | tail -n1)
             if [ -z "$GLIBC_FULL" ]; then
               echo "Failed to detect latest glibc"
@@ -76,22 +83,53 @@ jobs:
             tar xf "$GLIBC_FULL"
             mkdir -p glibc-build && cd glibc-build
 
-            export CC=aarch64-linux-gnu-gcc
-            export CXX=aarch64-linux-gnu-g++
-            export AR=aarch64-linux-gnu-ar
-            export AS=aarch64-linux-gnu-as
-            export LD=aarch64-linux-gnu-ld
-            export RANLIB=aarch64-linux-gnu-ranlib
-            export STRIP=aarch64-linux-gnu-strip
-            export CROSS_COMPILE=aarch64-linux-gnu-
+            # cross-compile for aarch64 when host triple is set
+            if [ -n "$HOST_TRIPLE" ]; then
+              export CC="${HOST_TRIPLE}-gcc"
+              export CXX="${HOST_TRIPLE}-g++"
+              export AR="${HOST_TRIPLE}-ar"
+              export AS="${HOST_TRIPLE}-as"
+              export LD="${HOST_TRIPLE}-ld"
+              export RANLIB="${HOST_TRIPLE}-ranlib"
+              export STRIP="${HOST_TRIPLE}-strip"
+              export CROSS_COMPILE="${HOST_TRIPLE}-"
+            fi
 
-            "../$GLIBC_VERSION/configure" --prefix=/usr --host="${MATRIX_TARGET_ARCH}-linux-gnu" --disable-werror
+            # configure and build (disable werror to avoid warnings-as-errors)
+            "../$GLIBC_VERSION/configure" --prefix=/usr --host="${HOST_TRIPLE:-${MATRIX_TARGET_ARCH}-linux-gnu}" --disable-werror
             make -j"$(nproc)"
             make DESTDIR="$PWD/out" install
 
+          elif [ "$MATRIX_TARGET_NAME" = "box64" ]; then
+            # shallow clone latest
+            git clone --depth 1 https://github.com/ptitSeb/box64.git
+            cd box64 || exit 1
+
+            # attempt to get a tag; fallback to commit hash if none
+            BOX64_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || git rev-parse --short HEAD || echo "unknown")
+            echo "Detected BOX64: $BOX64_VERSION"
+            echo "$BOX64_VERSION" > "$WORKDIR/out/v_box64.txt"
+
+            mkdir -p build && cd build
+
+            # If targeting arm64 on x86 runner, ask cmake to use the cross-compiler
+            if [ -n "$HOST_TRIPLE" ]; then
+              cmake .. -DCMAKE_BUILD_TYPE=Release \
+                       -DCMAKE_C_COMPILER="${HOST_TRIPLE}-gcc" \
+                       -DCMAKE_CXX_COMPILER="${HOST_TRIPLE}-g++" \
+                       -DCMAKE_SYSTEM_NAME=Linux \
+                       -DCMAKE_SYSTEM_PROCESSOR=aarch64
+            else
+              cmake .. -DCMAKE_BUILD_TYPE=Release
+            fi
+
+            make -j"$(nproc)"
+            # copy binary to out (if built)
+            cp box64 "$WORKDIR/out/" || true
+
           elif [ "$MATRIX_TARGET_NAME" = "uml" ]; then
             LTS=${MATRIX_TARGET_LTS:?No LTS specified}
-            # pick latest LTS patch release
+            # pick latest patch release in the LTS series
             KLIST=$(curl -s "https://cdn.kernel.org/pub/linux/kernel/v${LTS}.x/" | grep -oP "linux-${LTS}\.\d+\.\d+\.tar\.xz" | sort -V || true)
             KERNEL_FULL=$(echo "$KLIST" | tail -n1)
             if [ -z "$KERNEL_FULL" ]; then
@@ -107,17 +145,25 @@ jobs:
             tar xf "$KERNEL_FULL"
             cd "linux-$KERNEL_VERSION" || exit 1
 
+            # avoid -Werror=array-bounds stopping the build on newer GCC
             export KCFLAGS="-Wno-error=array-bounds"
 
-            if [ "$MATRIX_TARGET_ARCH" = "arm64" ]; then
-              make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-              make -j$(nproc) ARCH=arm64 KCFLAGS="$KCFLAGS" CROSS_COMPILE=aarch64-linux-gnu- Image
-              cp arch/arm64/boot/Image "$WORKDIR/out/Image-arm64-kernel$KERNEL_VERSION"
+            if [ "${MATRIX_TARGET_ARCH}" = "arm64" ]; then
+              # ensure cross toolchain was installed by apt step
+              make ARCH=arm64 CROSS_COMPILE="${HOST_TRIPLE}-" defconfig
+              make -j"$(nproc)" ARCH=arm64 KCFLAGS="$KCFLAGS" CROSS_COMPILE="${HOST_TRIPLE}-" Image
+              cp arch/arm64/boot/Image "$WORKDIR/out/Image-arm64-kernel${KERNEL_VERSION}"
             else
+              # x86_64 native build
               make ARCH=x86_64 KCFLAGS="$KCFLAGS" defconfig
-              make -j$(nproc) ARCH=x86_64 KCFLAGS="$KCFLAGS" bzImage
-              cp arch/x86_64/boot/bzImage "$WORKDIR/out/bzImage-x86_64-kernel$KERNEL_VERSION"
+              make -j"$(nproc)" ARCH=x86_64 KCFLAGS="$KCFLAGS" bzImage
+              cp arch/x86_64/boot/bzImage "$WORKDIR/out/bzImage-x86_64-kernel${KERNEL_VERSION}"
             fi
+
+          else
+            echo "Unknown matrix target: $MATRIX_TARGET_NAME"
+            exit 1
+          fi
 
       - name: List out/ for debug
         run: ls -la "$GITHUB_WORKSPACE/out" || true

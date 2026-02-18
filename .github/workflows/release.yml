@@ -46,8 +46,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential wget curl git bc bison flex libssl-dev libncurses5-dev cmake xz-utils
-
+          sudo apt-get install -y build-essential wget curl cmake git bc bison flex libssl-dev libncurses5-dev xz-utils libelf-dev
       - name: Build artifact
         env:
           MATRIX_TARGET_NAME: ${{ matrix.target.name }}

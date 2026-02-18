@@ -1,9 +1,11 @@
-name: Build Release Artifacts
+name: build weekly snapshot
 
 on:
   push:
     tags:
-      - '*'
+      - '*'  # still run on manual snapshot tags
+  schedule:
+    - cron: '0 4 * * 1'  # every Monday at 04:00 UTC
 
 permissions:
   contents: write
@@ -20,22 +22,22 @@ jobs:
             arch: arm64
           - name: uml
             arch: x86_64
-            kernel: 5.15.200
+            lts_major: 6
           - name: uml
             arch: x86_64
-            kernel: 6.12.73
+            lts_major: 5
           - name: uml
             arch: arm64
-            kernel: 5.15.200
+            lts_major: 6
           - name: uml
             arch: arm64
-            kernel: 6.12.73
+            lts_major: 5
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
 
-      - name: Set up QEMU (for cross-compilation)
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
         with:
           platforms: linux/arm64,linux/amd64
@@ -43,44 +45,90 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential wget curl git bc bison flex libssl-dev libncurses5-dev cmake
+          sudo apt-get install -y build-essential wget curl git bc bison flex libssl-dev libncurses5-dev cmake xz-utils
+
+      - name: Determine snapshot tag
+        id: snapshot
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            # manual tag push
+            echo "SNAPSHOT_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          else
+            # generate YYwWW for weekly snapshot
+            YEAR=$(date +%y)
+            WEEK=$(date +%V)
+            SNAPSHOT_TAG="${YEAR}w${WEEK}"
+            echo "SNAPSHOT_TAG=$SNAPSHOT_TAG" >> $GITHUB_ENV
+          fi
+          echo "Using snapshot tag: $SNAPSHOT_TAG"
 
       - name: Build artifact
+        env:
+          MATRIX_TARGET_NAME: ${{ matrix.target.name }}
+          MATRIX_TARGET_ARCH: ${{ matrix.target.arch }}
+          MATRIX_TARGET_LTS: ${{ matrix.target.lts_major }}
         run: |
           mkdir -p out
-          if [ "${MATRIX_TARGET_NAME}" = "glibc" ]; then
-            wget http://ftp.gnu.org/gnu/libc/glibc-2.42.tar.gz
-            tar xf glibc-2.42.tar.gz
+
+          # --------- glibc ----------
+          if [ "$MATRIX_TARGET_NAME" = "glibc" ]; then
+            GLIBC_FULL=$(curl -s http://ftp.gnu.org/gnu/libc/ | grep -oP 'glibc-\d+\.\d+(\.\d+)?\.tar\.gz' | sort -V | tail -n1)
+            GLIBC_VERSION=${GLIBC_FULL%.tar.gz}
+            echo $GLIBC_VERSION > out/v_glibc.txt
+            wget http://ftp.gnu.org/gnu/libc/$GLIBC_FULL
+            tar xf $GLIBC_FULL
             mkdir glibc-build && cd glibc-build
-            ../glibc-2.42/configure --prefix=/usr --host=${MATRIX_TARGET_ARCH}-linux-gnu
+            ../$GLIBC_VERSION/configure --prefix=/usr --host=${MATRIX_TARGET_ARCH}-linux-gnu
             make -j$(nproc)
             make DESTDIR=$PWD/out install
-          elif [ "${MATRIX_TARGET_NAME}" = "box64" ]; then
-            git clone https://github.com/ptitSeb/box64.git
+
+          # --------- box64 ----------
+          elif [ "$MATRIX_TARGET_NAME" = "box64" ]; then
+            git clone --depth 1 https://github.com/ptitSeb/box64.git
             cd box64
+            BOX64_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.4.0")
+            echo $BOX64_VERSION > ../out/v_box64.txt
             mkdir build && cd build
             cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=${MATRIX_TARGET_ARCH}
             make -j$(nproc)
             cp box64 ../../out/
-          elif [ "${MATRIX_TARGET_NAME}" = "uml" ]; then
-            KERNEL_FULL=${MATRIX_TARGET_KERNEL}
-            KERNEL_MAJOR=$(echo $KERNEL_FULL | cut -d. -f1)
-            URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/linux-${KERNEL_FULL}.tar.xz"
-            wget $URL
-            tar xf linux-${KERNEL_FULL}.tar.xz
-            cd linux-${KERNEL_FULL}
-            make ARCH=${MATRIX_TARGET_ARCH} defconfig
-            make -j$(nproc) ARCH=${MATRIX_TARGET_ARCH} bzImage
-            cp arch/${MATRIX_TARGET_ARCH}/boot/bzImage ../../out/bzImage-${MATRIX_TARGET_ARCH}-kernel${KERNEL_FULL}
+
+          # --------- UML kernels ----------
+          elif [ "$MATRIX_TARGET_NAME" = "uml" ]; then
+            LTS=${MATRIX_TARGET_LTS}
+            KERNEL_LIST=$(curl -s https://cdn.kernel.org/pub/linux/kernel/v${LTS}.x/ | grep -oP "linux-${LTS}\.\d+\.\d+\.tar\.xz" | sort -V)
+            KERNEL_FULL=$(echo "$KERNEL_LIST" | tail -n1)
+            KERNEL_VERSION=${KERNEL_FULL#linux-}
+            KERNEL_VERSION=${KERNEL_VERSION%.tar.xz}
+            echo $KERNEL_VERSION > ../out/v_kernel_${LTS}.txt
+
+            wget https://cdn.kernel.org/pub/linux/kernel/v${LTS}.x/$KERNEL_FULL
+            tar xf $KERNEL_FULL
+            cd linux-$KERNEL_VERSION
+            make ARCH=$MATRIX_TARGET_ARCH defconfig
+
+            if [ "$MATRIX_TARGET_ARCH" = "x86_64" ]; then
+              make ARCH=x86_64 bzImage -j$(nproc)
+              cp arch/x86_64/boot/bzImage ../../out/bzImage-x86_64-kernel$KERNEL_VERSION
+            else
+              make ARCH=$MATRIX_TARGET_ARCH Image -j$(nproc)
+              cp arch/$MATRIX_TARGET_ARCH/boot/Image ../../out/Image-${MATRIX_TARGET_ARCH}-kernel$KERNEL_VERSION
+            fi
           fi
-        env:
-          MATRIX_TARGET_NAME: ${{ matrix.target.name }}
-          MATRIX_TARGET_ARCH: ${{ matrix.target.arch }}
-          MATRIX_TARGET_KERNEL: ${{ matrix.target.kernel }}
+
+      - name: Combine versions into v.txt
+        run: |
+          cat out/v_glibc.txt > out/v.txt
+          cat out/v_box64.txt >> out/v.txt
+          cat out/v_kernel_6.txt >> out/v.txt || true
+          cat out/v_kernel_5.txt >> out/v.txt || true
+
+      - name: Debug out folder
+        run: ls -la out/
 
       - name: Upload assets to release
         uses: softprops/action-gh-release@v1
         with:
           files: out/*
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ env.SNAPSHOT_TAG }}
           generate_release_notes: true

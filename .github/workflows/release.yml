@@ -3,7 +3,7 @@ name: Build Release Artifacts
 on:
   push:
     tags:
-      - 'v*'   # trigger on version tags
+      - '*'
 
 permissions:
   contents: write

@@ -45,7 +45,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential wget curl cmake git bc bison flex \
+            build-essential wget curl jq cmake git bc bison flex \
             libssl-dev libncurses5-dev xz-utils libelf-dev \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             pkg-config
@@ -95,19 +95,34 @@ jobs:
 
           elif [ "$MATRIX_TARGET_NAME" = "uml" ]; then
             LTS=${MATRIX_TARGET_LTS:?No LTS specified}
-            # pick latest patch release in the LTS series
-            KLIST=$(curl -s "https://cdn.kernel.org/pub/linux/kernel/v${LTS}.x/" | grep -oP "linux-${LTS}\.\d+\.\d+\.tar\.xz" | sort -V || true)
-            KERNEL_FULL=$(echo "$KLIST" | tail -n1)
-            if [ -z "$KERNEL_FULL" ]; then
-              echo "Failed to detect kernel for LTS $LTS"
+            # pick newest active longterm release for this major (e.g. 6.12.x / 5.15.x)
+            KERNEL_SOURCE=$(
+              curl -fsSL "https://www.kernel.org/releases.json" \
+                | jq -r --arg lts "$LTS" '
+                    [
+                      .releases[]
+                      | select(.moniker == "longterm")
+                      | select(.iseol == false)
+                      | select(.version | startswith($lts + "."))
+                      | {version, source}
+                    ]
+                    | sort_by(.version | split(".") | map(tonumber))
+                    | last
+                    | .source // empty
+                  '
+            )
+
+            if [ -z "$KERNEL_SOURCE" ]; then
+              echo "Failed to detect active longterm kernel for major $LTS"
               exit 1
             fi
+            KERNEL_FULL=$(basename "$KERNEL_SOURCE")
             KERNEL_VERSION=${KERNEL_FULL#linux-}
             KERNEL_VERSION=${KERNEL_VERSION%.tar.xz}
             echo "Detected kernel LTS $LTS: $KERNEL_VERSION"
             echo "$KERNEL_VERSION" > "$WORKDIR/out/v_kernel_${LTS}.txt"
 
-            wget -q "https://cdn.kernel.org/pub/linux/kernel/v${LTS}.x/$KERNEL_FULL"
+            wget -q "$KERNEL_SOURCE"
             tar xf "$KERNEL_FULL"
             cd "linux-$KERNEL_VERSION" || exit 1
 

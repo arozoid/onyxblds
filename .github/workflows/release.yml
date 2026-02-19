@@ -3,12 +3,12 @@ name: build weekly snapshot
 on:
   push:
     tags:
-      - '*'               # still run on manual snapshot tags
+      - '*'
   schedule:
-    - cron: '0 04 * * 1'  # weekly: every Monday at 04:00 UTC
+    - cron: '0 04 * * 1'
 
 permissions:
-  contents: write        # needed to create tags/releases
+  contents: write
 
 jobs:
   build:
@@ -17,8 +17,6 @@ jobs:
     strategy:
       matrix:
         target:
-          - name: glibc
-            arch: arm64
           - name: box64
             arch: arm64
           - name: uml
@@ -68,39 +66,7 @@ jobs:
             HOST_TRIPLE="aarch64-linux-gnu"
           fi
 
-          if [ "$MATRIX_TARGET_NAME" = "glibc" ]; then
-            # latest stable glibc (pick 2.x stable releases)
-            GLIBC_FULL=$(curl -s http://ftp.gnu.org/gnu/libc/ | grep -oP 'glibc-2\.\d+\.\d+\.tar\.gz' | sort -V | tail -n1)
-            if [ -z "$GLIBC_FULL" ]; then
-              echo "Failed to detect latest glibc"
-              exit 1
-            fi
-            GLIBC_VERSION=${GLIBC_FULL%.tar.gz}
-            echo "Detected GLIBC: $GLIBC_VERSION"
-            echo "$GLIBC_VERSION" > "$WORKDIR/out/v_glibc.txt"
-
-            wget -q "http://ftp.gnu.org/gnu/libc/$GLIBC_FULL"
-            tar xf "$GLIBC_FULL"
-            mkdir -p glibc-build && cd glibc-build
-
-            # cross-compile for aarch64 when host triple is set
-            if [ -n "$HOST_TRIPLE" ]; then
-              export CC="${HOST_TRIPLE}-gcc"
-              export CXX="${HOST_TRIPLE}-g++"
-              export AR="${HOST_TRIPLE}-ar"
-              export AS="${HOST_TRIPLE}-as"
-              export LD="${HOST_TRIPLE}-ld"
-              export RANLIB="${HOST_TRIPLE}-ranlib"
-              export STRIP="${HOST_TRIPLE}-strip"
-              export CROSS_COMPILE="${HOST_TRIPLE}-"
-            fi
-
-            # configure and build (disable werror to avoid warnings-as-errors)
-            "../$GLIBC_VERSION/configure" --prefix=/usr --host="${HOST_TRIPLE:-${MATRIX_TARGET_ARCH}-linux-gnu}" --disable-werror
-            make -j"$(nproc)"
-            make DESTDIR="$PWD/out" install
-
-          elif [ "$MATRIX_TARGET_NAME" = "box64" ]; then
+          if [ "$MATRIX_TARGET_NAME" = "box64" ]; then
             # shallow clone latest
             git clone --depth 1 https://github.com/ptitSeb/box64.git
             cd box64 || exit 1

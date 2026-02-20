@@ -67,58 +67,52 @@ jobs:
           fi
 
   build:
-    name: build (matrix)
+    name: build (${{ matrix.target_name }}-${{ matrix.target_arch }}${{ matrix.target_name == 'uml' && format('-lts{0}', matrix.target_lts) || '' }})
     runs-on: ubuntu-latest
     needs: prepare_release
     strategy:
+      fail-fast: false
       matrix:
-        target:
-          - name: box64
-            arch: arm64
-          - name: loader
-            arch: arm64
-            lts_major: 6
-            libc: musl
-          - name: loader
-            arch: arm64
-            lts_major: 6
-            libc: glibc
-          - name: loader
-            arch: arm64
-            lts_major: 6
-            libc: android-ndk
-          - name: loader
-            arch: arm64
-            lts_major: 5
-            libc: musl
-          - name: loader
-            arch: arm64
-            lts_major: 5
-            libc: glibc
-          - name: loader
-            arch: arm64
-            lts_major: 5
-            libc: android-ndk
+        include:
+          - target_name: box64
+            target_arch: arm64
+          - target_name: uml
+            target_arch: x86_64
+            target_lts: 6
+          - target_name: uml
+            target_arch: x86_64
+            target_lts: 5
+          - target_name: uml
+            target_arch: arm64
+            target_lts: 6
+          - target_name: uml
+            target_arch: arm64
+            target_lts: 5
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
 
+      - name: Set up QEMU for arm64 UML build
+        if: ${{ matrix.target_name == 'uml' && matrix.target_arch == 'arm64' }}
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential wget curl jq cmake git bc bison flex unzip musl-tools \
+            build-essential wget curl jq cmake git bc bison flex \
             libssl-dev libncurses5-dev xz-utils libelf-dev \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             pkg-config
 
       - name: Build artifact
         env:
-          MATRIX_TARGET_NAME: ${{ matrix.target.name }}
-          MATRIX_TARGET_ARCH: ${{ matrix.target.arch }}
-          MATRIX_TARGET_LTS: ${{ matrix.target.lts_major }}
-          MATRIX_TARGET_LIBC: ${{ matrix.target.libc }}
+          MATRIX_TARGET_NAME: ${{ matrix.target_name }}
+          MATRIX_TARGET_ARCH: ${{ matrix.target_arch }}
+          MATRIX_TARGET_LTS: ${{ matrix.target_lts }}
           WORKDIR: ${{ github.workspace }}
         run: |
           set -euo pipefail
@@ -157,15 +151,10 @@ jobs:
             # copy binary to out (if built)
             cp box64 "$WORKDIR/out/" || true
 
-          elif [ "$MATRIX_TARGET_NAME" = "loader" ]; then
+          elif [ "$MATRIX_TARGET_NAME" = "uml" ]; then
             LTS=${MATRIX_TARGET_LTS:?No LTS specified}
-            LIBC=${MATRIX_TARGET_LIBC:?No libc specified}
-            LIBC_SUFFIX=""
-            if [ -n "${MATRIX_TARGET_LIBC:-}" ]; then
-              LIBC_SUFFIX="-${MATRIX_TARGET_LIBC}"
-            fi
-            if [ "${MATRIX_TARGET_ARCH}" != "arm64" ]; then
-              echo "Unsupported loader arch: ${MATRIX_TARGET_ARCH}. This matrix is arm64-only."
+            if [ "${MATRIX_TARGET_ARCH}" != "x86_64" ] && [ "${MATRIX_TARGET_ARCH}" != "arm64" ]; then
+              echo "Unsupported UML arch: ${MATRIX_TARGET_ARCH}. Supported: x86_64, arm64."
               exit 1
             fi
             # pick newest active longterm release for this major (e.g. 6.12.x / 5.15.x)
@@ -192,110 +181,36 @@ jobs:
             KERNEL_FULL=$(basename "$KERNEL_SOURCE")
             KERNEL_VERSION=${KERNEL_FULL#linux-}
             KERNEL_VERSION=${KERNEL_VERSION%.tar.xz}
-            echo "Detected kernel LTS $LTS (${MATRIX_TARGET_ARCH}/${LIBC}): $KERNEL_VERSION"
-            echo "$KERNEL_VERSION" > "$WORKDIR/out/v_kernel_lts${LTS}-${MATRIX_TARGET_ARCH}${LIBC_SUFFIX}.txt"
+            echo "Detected UML kernel LTS $LTS (${MATRIX_TARGET_ARCH}): $KERNEL_VERSION"
 
             wget -q "$KERNEL_SOURCE"
             tar xf "$KERNEL_FULL"
             cd "linux-$KERNEL_VERSION" || exit 1
 
-            # Build arm64 kernel image for the selected LTS series.
+            # Build UML kernel binary for the selected LTS series.
             export KCFLAGS="-Wno-error=array-bounds"
-            make ARCH=arm64 CROSS_COMPILE="${HOST_TRIPLE}-" defconfig
-            make -j"$(nproc)" ARCH=arm64 KCFLAGS="$KCFLAGS" CROSS_COMPILE="${HOST_TRIPLE}-" Image
-            KERNEL_OUT="Image-arm64-kernel${KERNEL_VERSION}-lts${LTS}${LIBC_SUFFIX}"
-            cp arch/arm64/boot/Image "$WORKDIR/out/$KERNEL_OUT"
-
-            # Build a real arm64 loader binary with libc-specific toolchains.
-            {
-              echo '#include <errno.h>'
-              echo '#include <stdio.h>'
-              echo '#include <stdlib.h>'
-              echo '#include <string.h>'
-              echo '#include <unistd.h>'
-              echo
-              echo 'int main(int argc, char **argv) {'
-              echo '  const char *kernel = getenv("ONYX_KERNEL");'
-              echo '  const char *cmdline = getenv("ONYX_CMDLINE");'
-              echo "  if (!cmdline || cmdline[0] == '\\0') cmdline = \"console=ttyAMA0\";"
-              echo '  if (!kernel || kernel[0] == '"'"'\0'"'"') {'
-              echo '    if (argc < 2) {'
-              echo '      fprintf(stderr, "usage: %s <kernel-image>\n", argv[0]);'
-              echo '      return 2;'
-              echo '    }'
-              echo '    kernel = argv[1];'
-              echo '  }'
-              echo
-              echo '  char *const load_argv[] = {'
-              echo '      "kexec", "-l", (char *)kernel, "--append", (char *)cmdline, NULL};'
-              echo '  execvp("kexec", load_argv);'
-              echo '  fprintf(stderr, "failed to exec kexec -l: %s\n", strerror(errno));'
-              echo '  return 1;'
-              echo '}'
-            } > /tmp/onyx_loader.c
-
-            LOADER_OUT="loader-arm64-kernel${KERNEL_VERSION}-lts${LTS}${LIBC_SUFFIX}"
-            case "$LIBC" in
-              glibc)
-                if ! command -v zig >/dev/null 2>&1; then
-                  ZIG_VERSION="0.13.0"
-                  ZIG_TARBALL="zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
-                  wget -q "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}" -O "/tmp/${ZIG_TARBALL}"
-                  tar -xf "/tmp/${ZIG_TARBALL}" -C /tmp
-                  export PATH="/tmp/zig-linux-x86_64-${ZIG_VERSION}:$PATH"
-                fi
-                zig cc -target aarch64-linux-gnu.2.17 -O2 -s /tmp/onyx_loader.c -o "$WORKDIR/out/$LOADER_OUT"
-                ;;
-              musl)
-                if ! command -v zig >/dev/null 2>&1; then
-                  ZIG_VERSION="0.13.0"
-                  ZIG_TARBALL="zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
-                  wget -q "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}" -O "/tmp/${ZIG_TARBALL}"
-                  tar -xf "/tmp/${ZIG_TARBALL}" -C /tmp
-                  export PATH="/tmp/zig-linux-x86_64-${ZIG_VERSION}:$PATH"
-                fi
-                zig cc -target aarch64-linux-musl -O2 -s -static /tmp/onyx_loader.c -o "$WORKDIR/out/$LOADER_OUT"
-                ;;
-              android-ndk)
-                NDK_VERSION="r27c"
-                NDK_ZIP="android-ndk-${NDK_VERSION}-linux.zip"
-                NDK_ROOT="/tmp/android-ndk-${NDK_VERSION}"
-                if [ ! -x "${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" ]; then
-                  wget -q "https://dl.google.com/android/repository/${NDK_ZIP}" -O "/tmp/${NDK_ZIP}"
-                  unzip -q "/tmp/${NDK_ZIP}" -d /tmp
-                fi
-                "${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" \
-                  -O2 -s /tmp/onyx_loader.c -o "$WORKDIR/out/$LOADER_OUT"
-                ;;
-              *)
-                echo "Unsupported loader libc: $LIBC. Supported: glibc, musl, android-ndk"
-                exit 1
-                ;;
-            esac
-
-            # Wrapper to trigger kexec load + execute.
-            WRAP_OUT="loader-run-arm64-lts${LTS}${LIBC_SUFFIX}.sh"
-            {
-              echo '#!/usr/bin/env bash'
-              echo 'set -euo pipefail'
-              echo 'HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)'
-              echo "BIN=\"\${1:-\$HERE/$LOADER_OUT}\""
-              echo "KERNEL=\"\${2:-\$HERE/$KERNEL_OUT}\""
-              echo 'if [ "${EUID:-$(id -u)}" -ne 0 ]; then'
-              echo '  echo "run as root (kexec requires CAP_SYS_BOOT)" >&2'
-              echo '  exit 1'
-              echo 'fi'
-              echo 'if ! command -v kexec >/dev/null 2>&1; then'
-              echo '  echo "kexec not found; install kexec-tools" >&2'
-              echo '  exit 1'
-              echo 'fi'
-              echo 'ONYX_KERNEL="$KERNEL" "$BIN"'
-              echo 'kexec -e'
-            } > "$WORKDIR/out/$WRAP_OUT"
-            chmod +x "$WORKDIR/out/$WRAP_OUT"
-
-            # keep per-target version marker
-            echo "$LIBC" > "$WORKDIR/out/v_loader_lts${LTS}-arm64${LIBC_SUFFIX}.txt"
+            if [ "${MATRIX_TARGET_ARCH}" = "x86_64" ]; then
+              make ARCH=um SUBARCH=x86_64 defconfig
+              make -j"$(nproc)" ARCH=um SUBARCH=x86_64 KCFLAGS="$KCFLAGS" HOSTLDFLAGS="-static" linux
+            else
+              docker run --rm --platform linux/arm64 \
+                -v "$PWD:/src" -w /src ubuntu:24.04 bash -lc '
+                  set -euo pipefail
+                  apt-get update
+                  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                    build-essential bc bison flex libssl-dev libncurses5-dev libelf-dev
+                  make ARCH=um SUBARCH=arm64 defconfig
+                  make -j"$(nproc)" ARCH=um SUBARCH=arm64 KCFLAGS="-Wno-error=array-bounds" HOSTLDFLAGS="-static" linux
+                '
+            fi
+            if ! file linux | grep -qi "statically linked"; then
+              echo "UML binary is not statically linked"
+              file linux || true
+              exit 1
+            fi
+            KERNEL_OUT="uml-${MATRIX_TARGET_ARCH}-lts${LTS}"
+            cp linux "$WORKDIR/out/$KERNEL_OUT"
+            echo "$KERNEL_VERSION" > "$WORKDIR/out/v_${KERNEL_OUT}.txt"
 
           else
             echo "Unknown matrix target: $MATRIX_TARGET_NAME"
